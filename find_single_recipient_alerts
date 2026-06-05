@@ -1,0 +1,212 @@
+"""
+find_single_recipient_alerts.py  (Requirement 3)
+────────────────────────────────────────────────
+Fetches all Email Alerts (WorkflowAlert) that have exactly ONE
+email recipient configured.
+
+Requirements:
+    pip install requests
+
+Usage:
+    python find_single_recipient_alerts.py
+"""
+
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+import requests
+
+# ─── Configuration — fill in before running ───────────────────────────────────
+USERNAME    = "prateekjr@gmail.com"
+PASSWORD    = "MyIndia@123"
+TOKEN       = "BLbGqW5VG9MdhHl1dHduZ4z7T"  # appended to password automatically
+SANDBOX     = False                 # True → test.salesforce.com
+OUTPUT_FILE = "single_recipient_alerts.json"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+LOGIN_URL_PROD    = "https://login.salesforce.com/services/Soap/u/59.0"
+LOGIN_URL_SANDBOX = "https://test.salesforce.com/services/Soap/u/59.0"
+API_VERSION       = "59.0"
+
+NS = {
+    "soapenv": "http://schemas.xmlsoap.org/soap/envelope/",
+    "urn":     "urn:partner.soap.sforce.com",
+    "mns":     "http://soap.sforce.com/2006/04/metadata",
+}
+
+# Valid recipient types in Salesforce Email Alerts:
+#   accountOwner, caseTeam, contactLookup, creator, email,
+#   opportunityTeam, owner, partnerUser, portalRole,
+#   portalRoleSubordinates, role, roleSubordinates, roleSubordinatesInternal,
+#   salesTeam, user
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+def login(username: str, password: str, token: str, sandbox: bool) -> tuple[str, str]:
+    url  = LOGIN_URL_SANDBOX if sandbox else LOGIN_URL_PROD
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Body>
+    <urn:login>
+      <urn:username>{username}</urn:username>
+      <urn:password>{password}{token}</urn:password>
+    </urn:login>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    resp = requests.post(
+        url, data=body.encode(),
+        headers={"Content-Type": "text/xml", "SOAPAction": "login"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    root       = ET.fromstring(resp.content)
+    session_id = _txt(root, ".//urn:sessionId")
+    server_url = _txt(root, ".//urn:serverUrl")
+    meta_url   = server_url.replace("/Soap/u/", "/Soap/m/")
+    print(f"[✓] Authenticated  →  {meta_url.split('/services')[0]}")
+    return session_id, meta_url
+
+
+# ─── SOAP helpers ─────────────────────────────────────────────────────────────
+def _post(url: str, body: str, action: str) -> ET.Element:
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
+    resp = requests.post(url, data=body.encode(), headers=headers, timeout=60)
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}: {resp.text[:400]}", file=sys.stderr)
+        resp.raise_for_status()
+    return ET.fromstring(resp.content)
+
+
+def _txt(elem: ET.Element, path: str) -> str:
+    node = elem.find(path, NS)
+    return (node.text or "").strip() if node is not None else ""
+
+
+def list_metadata(session_id: str, meta_url: str, meta_type: str) -> list[str]:
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:listMetadata>
+      <mns:queries><mns:type>{meta_type}</mns:type></mns:queries>
+      <mns:asOfVersion>{API_VERSION}</mns:asOfVersion>
+    </mns:listMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    root = _post(meta_url, body, "listMetadata")
+    return [_txt(r, "mns:fullName") for r in root.findall(".//mns:result", NS) if _txt(r, "mns:fullName")]
+
+
+def read_metadata_chunk(session_id: str, meta_url: str, meta_type: str, full_names: list[str]) -> ET.Element:
+    members = "".join(f"<mns:fullNames>{n}</mns:fullNames>" for n in full_names)
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:readMetadata>
+      <mns:type>{meta_type}</mns:type>
+      {members}
+    </mns:readMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    return _post(meta_url, body, "readMetadata")
+
+
+# ─── Parsing ──────────────────────────────────────────────────────────────────
+def parse_alert(record: ET.Element) -> dict:
+    """
+    Parse a WorkflowAlert <records> element into a rich dict, including
+    the full list of recipients.
+    """
+    recipients_elems = record.findall("mns:recipients", NS)
+    recipients = []
+    for r in recipients_elems:
+        recipient_entry: dict = {
+            "type":      _txt(r, "mns:type"),
+            "recipient": _txt(r, "mns:recipient"),
+        }
+        recipients.append(recipient_entry)
+
+    return {
+        "fullName":      _txt(record, "mns:fullName"),
+        "description":   _txt(record, "mns:description"),
+        "template":      _txt(record, "mns:template"),
+        "senderType":    _txt(record, "mns:senderType"),
+        "senderAddress": _txt(record, "mns:senderAddress"),
+        "protected":     _txt(record, "mns:protected"),
+        "recipientCount": len(recipients),
+        "recipients":    recipients,
+    }
+
+
+# ─── Core logic ───────────────────────────────────────────────────────────────
+def fetch_single_recipient_alerts(session_id: str, meta_url: str) -> list[dict]:
+    """
+    Retrieve every WorkflowAlert and return only those with exactly 1 recipient.
+    """
+    print("[→] Listing all Email Alerts (WorkflowAlert) …")
+    all_names = list_metadata(session_id, meta_url, "WorkflowAlert")
+    print(f"    Found {len(all_names)} Email Alert(s) in the org.")
+
+    single_recipient_alerts: list[dict] = []
+    total_processed = 0
+
+    for i in range(0, len(all_names), 10):
+        chunk = all_names[i : i + 10]
+        print(f"    Reading alerts {i+1}–{i+len(chunk)} …")
+        root = read_metadata_chunk(session_id, meta_url, "WorkflowAlert", chunk)
+
+        for record in root.findall(".//mns:records", NS):
+            alert = parse_alert(record)
+            total_processed += 1
+            if alert["recipientCount"] == 1:
+                single_recipient_alerts.append(alert)
+
+    print(f"\n    Processed : {total_processed} alert(s)")
+    print(f"    Single-recipient alerts: {len(single_recipient_alerts)}")
+    return single_recipient_alerts
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    session_id, meta_url = login(USERNAME, PASSWORD, TOKEN, SANDBOX)
+
+    single_alerts = fetch_single_recipient_alerts(session_id, meta_url)
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(single_alerts, f, indent=2, ensure_ascii=False)
+
+    # ── Pretty console report ──────────────────────────────────────────────────
+    print("\n" + "═" * 70)
+    print("  EMAIL ALERTS WITH EXACTLY 1 RECIPIENT")
+    print("═" * 70)
+    if not single_alerts:
+        print("  None found.")
+    else:
+        header = f"  {'API Name':<45} {'Recipient Type':<20} {'Recipient'}"
+        print(header)
+        print("  " + "─" * 68)
+        for alert in single_alerts:
+            r      = alert["recipients"][0]
+            rtype  = r.get("type", "")
+            rvalue = r.get("recipient", "")
+            name   = alert["fullName"]
+            # Truncate long names for display only
+            display_name = name if len(name) <= 44 else name[:41] + "…"
+            print(f"  {display_name:<45} {rtype:<20} {rvalue}")
+
+    print("═" * 70)
+    print(f"\n[✓] {len(single_alerts)} alert(s) written to '{OUTPUT_FILE}'")
+
+
+if __name__ == "__main__":
+    main()

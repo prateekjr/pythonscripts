@@ -1,0 +1,76 @@
+import requests
+from simple_salesforce import Salesforce
+import pandas as pd
+import os
+
+USERNAME = "prateekjr@gmail.com"
+PASSWORD = "MyIndia@123"
+SECURITY_TOKEN = "BLbGqW5VG9MdhHl1dHduZ4z7T"
+
+LOGIN_URL = "https://login.salesforce.com"
+API_VERSION = "v66.0"
+
+
+sf = Salesforce(
+    username=USERNAME,
+    password=PASSWORD,
+    security_token=SECURITY_TOKEN
+)
+
+session_id = sf.session_id
+instance_url = f"https://{sf.sf_instance}"
+
+headers = {
+    "Authorization": f"Bearer {session_id}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+url = f"{instance_url}/services/data/{API_VERSION}/process/rules"
+
+response = requests.get(url, headers=headers)
+data = response.json()
+rules_map = data.get("rules", {})
+results = []
+
+for object_name, rules in rules_map.items():
+    for rule in rules:
+        actions = rule.get("actions", [])
+        if not actions:
+            row = {
+                "object": object_name,
+                "rule_id": rule.get("id"),
+                "rule_name": rule.get("name"),
+                "description": rule.get("description")
+            }
+            results.append(row)
+            print(f"Workflow Without Any Action: {object_name} | Rule: {rule.get('name')} | Id: {rule.get('id')}")
+
+# Export to Excel
+if results:
+    df = pd.DataFrame(results)
+    excel_file = "workflow_rules_without_actions.xlsx"
+    df.to_excel(excel_file, index=False, sheet_name="Workflow Rules")
+
+    # Auto-adjust column widths
+    from openpyxl import load_workbook
+
+    wb = load_workbook(excel_file)
+    ws = wb.active
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    wb.save(excel_file)
+    print(f"\n✅ Excel file saved: {os.path.abspath(excel_file)}")
+    print(f"📊 Total rules without actions: {len(results)}")
+else:
+    print("\nNo workflow rules without actions found.")

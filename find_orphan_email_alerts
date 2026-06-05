@@ -1,0 +1,239 @@
+"""
+find_orphan_email_alerts.py  (Requirement 1)
+────────────────────────────────────────────
+Fetches all Email Alerts that are NOT associated with any Workflow Rule.
+
+Strategy
+--------
+1. List every WorkflowAlerts metadata item  →  the full universe of Email Alerts.
+2. Read every WorkflowRule                  →  collect all action references.
+3. Diff the two sets                        →  orphaned alerts.
+
+Requirements:
+    pip install requests
+
+Usage:
+    python find_orphan_email_alerts.py
+"""
+
+import json
+import sys
+import xml.etree.ElementTree as ET
+from typing import Optional
+
+import requests
+
+# ─── Configuration — fill in before running ───────────────────────────────────
+USERNAME    = "prateekjr@gmail.com"
+PASSWORD    = "MyIndia@123"
+TOKEN       = "BLbGqW5VG9MdhHl1dHduZ4z7T"  # appended to password automatically
+SANDBOX     = False                 # True → test.salesforce.com
+OUTPUT_FILE = "orphan_email_alerts.json"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Re-use helpers from the shared module ────────────────────────────────────
+# (Copy-pasted so each script is self-contained.)
+LOGIN_URL_PROD    = "https://login.salesforce.com/services/Soap/u/59.0"
+LOGIN_URL_SANDBOX = "https://test.salesforce.com/services/Soap/u/59.0"
+API_VERSION       = "59.0"
+
+NS = {
+    "soapenv": "http://schemas.xmlsoap.org/soap/envelope/",
+    "urn":     "urn:partner.soap.sforce.com",
+    "mns":     "http://soap.sforce.com/2006/04/metadata",
+}
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+def login(username: str, password: str, token: str, sandbox: bool) -> tuple[str, str]:
+    url  = LOGIN_URL_SANDBOX if sandbox else LOGIN_URL_PROD
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Body>
+    <urn:login>
+      <urn:username>{username}</urn:username>
+      <urn:password>{password}{token}</urn:password>
+    </urn:login>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+    resp = requests.post(url, data=body.encode(), headers={"Content-Type": "text/xml", "SOAPAction": "login"}, timeout=30)
+    resp.raise_for_status()
+    root       = ET.fromstring(resp.content)
+    session_id = _txt(root, ".//urn:sessionId")
+    server_url = _txt(root, ".//urn:serverUrl")
+    meta_url   = server_url.replace("/Soap/u/", "/Soap/m/")
+    print(f"[✓] Authenticated  →  {meta_url.split('/services')[0]}")
+    return session_id, meta_url
+
+
+# ─── SOAP helpers ─────────────────────────────────────────────────────────────
+def _post(url: str, body: str, action: str) -> ET.Element:
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
+    resp = requests.post(url, data=body.encode(), headers=headers, timeout=60)
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}: {resp.text[:400]}", file=sys.stderr)
+        resp.raise_for_status()
+    return ET.fromstring(resp.content)
+
+
+def _txt(elem: ET.Element, path: str) -> str:
+    node = elem.find(path, NS)
+    return (node.text or "").strip() if node is not None else ""
+
+
+def list_metadata(session_id: str, meta_url: str, meta_type: str) -> list[str]:
+    """List full-names of a metadata type."""
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:listMetadata>
+      <mns:queries><mns:type>{meta_type}</mns:type></mns:queries>
+      <mns:asOfVersion>{API_VERSION}</mns:asOfVersion>
+    </mns:listMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    root = _post(meta_url, body, "listMetadata")
+    return [_txt(r, "mns:fullName") for r in root.findall(".//mns:result", NS) if _txt(r, "mns:fullName")]
+
+
+def read_metadata_chunk(session_id: str, meta_url: str, meta_type: str, full_names: list[str]) -> ET.Element:
+    """Read up to 10 metadata records at once."""
+    members = "".join(f"<mns:fullNames>{n}</mns:fullNames>" for n in full_names)
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:readMetadata>
+      <mns:type>{meta_type}</mns:type>
+      {members}
+    </mns:readMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    return _post(meta_url, body, "readMetadata")
+
+
+# ─── Core logic ───────────────────────────────────────────────────────────────
+def fetch_all_email_alert_names(session_id: str, meta_url: str) -> set[str]:
+    """
+    Return the full set of WorkflowAlert fullNames defined in the org.
+    fullName format:  SObject.AlertApiName
+    """
+    print("[→] Listing all Email Alerts (WorkflowAlert) …")
+    names = list_metadata(session_id, meta_url, "WorkflowAlert")
+    print(f"    Found {len(names)} Email Alert(s) in the org.")
+    return set(names)
+
+
+def fetch_email_alerts_in_rules(session_id: str, meta_url: str) -> set[str]:
+    """
+    Read every WorkflowRule and collect the names of Email Alert actions
+    referenced inside <actions> blocks whose <type> = 'Alert'.
+
+    Returns a set of  SObject.AlertApiName  strings.
+    """
+    print("[→] Listing all Workflow Rules …")
+    rule_names = list_metadata(session_id, meta_url, "WorkflowRule")
+    print(f"    Found {len(rule_names)} WorkflowRule(s).")
+
+    alert_names_in_rules: set[str] = set()
+
+    for i in range(0, len(rule_names), 10):
+        chunk = rule_names[i : i + 10]
+        print(f"    Reading rules {i+1}–{i+len(chunk)} …")
+        root = read_metadata_chunk(session_id, meta_url, "WorkflowRule", chunk)
+
+        for record in root.findall(".//mns:records", NS):
+            rule_full_name = _txt(record, "mns:fullName")
+            # Derive the SObject prefix  (e.g. "Account" from "Account.MyRule")
+            sobject = rule_full_name.split(".")[0] if "." in rule_full_name else ""
+
+            for action in record.findall("mns:actions", NS):
+                action_type = _txt(action, "mns:type")
+                action_name = _txt(action, "mns:name")
+                if action_type == "Alert" and action_name:
+                    # Build the canonical fullName for the alert:  SObject.AlertName
+                    alert_full_name = f"{sobject}.{action_name}" if sobject else action_name
+                    alert_names_in_rules.add(alert_full_name)
+
+    print(f"    Email Alert actions referenced by rules: {len(alert_names_in_rules)}")
+    return alert_names_in_rules
+
+
+def fetch_orphan_alert_details(
+    session_id: str,
+    meta_url: str,
+    orphan_names: list[str],
+) -> list[dict]:
+    """
+    Read full metadata for each orphaned Email Alert and return a list of dicts.
+    """
+    results: list[dict] = []
+    for i in range(0, len(orphan_names), 10):
+        chunk = orphan_names[i : i + 10]
+        print(f"    Fetching details for orphan alerts {i+1}–{i+len(chunk)} …")
+        root = read_metadata_chunk(session_id, meta_url, "WorkflowAlert", chunk)
+
+        for record in root.findall(".//mns:records", NS):
+            recipients = record.findall("mns:recipients", NS)
+            results.append({
+                "fullName":    _txt(record, "mns:fullName"),
+                "description": _txt(record, "mns:description"),
+                "template":    _txt(record, "mns:template"),
+                "protected":   _txt(record, "mns:protected"),
+                "senderType":  _txt(record, "mns:senderType"),
+                "senderAddress": _txt(record, "mns:senderAddress"),
+                "recipientCount": len(recipients),
+                "recipients": [
+                    {
+                        "type":  _txt(r, "mns:type"),
+                        "recipient": _txt(r, "mns:recipient"),
+                    }
+                    for r in recipients
+                ],
+            })
+    return results
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    session_id, meta_url = login(USERNAME, PASSWORD, TOKEN, SANDBOX)
+
+    # Step 1 – all alerts that exist
+    all_alerts = fetch_all_email_alert_names(session_id, meta_url)
+
+    # Step 2 – alerts that are referenced by at least one rule
+    alerts_in_rules = fetch_email_alerts_in_rules(session_id, meta_url)
+
+    # Step 3 – orphaned = all minus referenced
+    orphaned_names = sorted(all_alerts - alerts_in_rules)
+    print(f"\n[→] Orphaned Email Alerts (not in any rule): {len(orphaned_names)}")
+
+    if not orphaned_names:
+        print("    → No orphaned Email Alerts found.")
+        return
+
+    # Step 4 – fetch full details of orphans
+    print("[→] Fetching full details of orphaned alerts …")
+    orphan_details = fetch_orphan_alert_details(session_id, meta_url, orphaned_names)
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(orphan_details, f, indent=2, ensure_ascii=False)
+
+    print(f"\n[✓] Results written to '{OUTPUT_FILE}'")
+    print(f"    {'API Name':<50} {'Recipients':>10}")
+    print(f"    {'-'*50} {'-'*10}")
+    for a in orphan_details:
+        print(f"    {a['fullName']:<50} {a['recipientCount']:>10}")
+
+
+if __name__ == "__main__":
+    main()

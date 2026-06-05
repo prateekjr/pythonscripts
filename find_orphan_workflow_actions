@@ -1,0 +1,280 @@
+"""
+find_orphan_workflow_actions.py  (Requirement 2)
+────────────────────────────────────────────────
+Fetches ALL Workflow Actions of every type that are NOT linked to any
+Workflow Rule.
+
+Action types covered
+--------------------
+  WorkflowAlert        → Email Alert
+  WorkflowFieldUpdate  → Field Update
+  WorkflowOutboundMessage → Outbound Message
+  WorkflowTask         → Task
+  WorkflowSend         → (legacy) Send Action
+
+Requirements:
+    pip install requests
+
+Usage:
+    python find_orphan_workflow_actions.py
+"""
+
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+import requests
+
+# ─── Configuration — fill in before running ───────────────────────────────────
+USERNAME    = "prateekjr@gmail.com"
+PASSWORD    = "MyIndia@123"
+TOKEN       = "BLbGqW5VG9MdhHl1dHduZ4z7T"  # appended to password automatically
+SANDBOX     = False                 # True → test.salesforce.com
+OUTPUT_FILE = "orphan_workflow_actions.json"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+LOGIN_URL_PROD    = "https://login.salesforce.com/services/Soap/u/59.0"
+LOGIN_URL_SANDBOX = "https://test.salesforce.com/services/Soap/u/59.0"
+API_VERSION       = "59.0"
+
+NS = {
+    "soapenv": "http://schemas.xmlsoap.org/soap/envelope/",
+    "urn":     "urn:partner.soap.sforce.com",
+    "mns":     "http://soap.sforce.com/2006/04/metadata",
+}
+
+# Metadata type  →  the value used in <actions><type> elements inside WorkflowRule
+ACTION_TYPE_MAP: dict[str, str] = {
+    "WorkflowAlert":           "Alert",
+    "WorkflowFieldUpdate":     "FieldUpdate",
+    "WorkflowOutboundMessage": "OutboundMessage",
+    "WorkflowTask":            "Task",
+    "WorkflowSend":            "Send",
+}
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+def login(username: str, password: str, token: str, sandbox: bool) -> tuple[str, str]:
+    url  = LOGIN_URL_SANDBOX if sandbox else LOGIN_URL_PROD
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Body>
+    <urn:login>
+      <urn:username>{username}</urn:username>
+      <urn:password>{password}{token}</urn:password>
+    </urn:login>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    resp = requests.post(url, data=body.encode(), headers={"Content-Type": "text/xml", "SOAPAction": "login"}, timeout=30)
+    resp.raise_for_status()
+    root       = ET.fromstring(resp.content)
+    session_id = _txt(root, ".//urn:sessionId")
+    server_url = _txt(root, ".//urn:serverUrl")
+    meta_url   = server_url.replace("/Soap/u/", "/Soap/m/")
+    print(f"[✓] Authenticated  →  {meta_url.split('/services')[0]}")
+    return session_id, meta_url
+
+
+# ─── SOAP helpers ─────────────────────────────────────────────────────────────
+def _post(url: str, body: str, action: str) -> ET.Element:
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
+    resp = requests.post(url, data=body.encode(), headers=headers, timeout=60)
+    if resp.status_code != 200:
+        print(f"[!] HTTP {resp.status_code}: {resp.text[:400]}", file=sys.stderr)
+        resp.raise_for_status()
+    return ET.fromstring(resp.content)
+
+
+def _txt(elem: ET.Element, path: str) -> str:
+    node = elem.find(path, NS)
+    return (node.text or "").strip() if node is not None else ""
+
+
+def list_metadata(session_id: str, meta_url: str, meta_type: str) -> list[str]:
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:listMetadata>
+      <mns:queries><mns:type>{meta_type}</mns:type></mns:queries>
+      <mns:asOfVersion>{API_VERSION}</mns:asOfVersion>
+    </mns:listMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    root = _post(meta_url, body, "listMetadata")
+    return [_txt(r, "mns:fullName") for r in root.findall(".//mns:result", NS) if _txt(r, "mns:fullName")]
+
+
+def read_metadata_chunk(session_id: str, meta_url: str, meta_type: str, full_names: list[str]) -> ET.Element:
+    members = "".join(f"<mns:fullNames>{n}</mns:fullNames>" for n in full_names)
+    body = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:mns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header>
+    <mns:SessionHeader><mns:sessionId>{session_id}</mns:sessionId></mns:SessionHeader>
+  </soapenv:Header>
+  <soapenv:Body>
+    <mns:readMetadata>
+      <mns:type>{meta_type}</mns:type>
+      {members}
+    </mns:readMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+    return _post(meta_url, body, "readMetadata")
+
+
+# ─── Core: build referenced-action index ─────────────────────────────────────
+def build_rule_action_index(session_id: str, meta_url: str) -> dict[str, set[str]]:
+    """
+    Walk all WorkflowRules and return a dict:
+        {action_type_value → set(fullName_strings)}
+
+    where fullName_strings look like  "Account.MyAlertName"
+    (reconstructed from the rule's SObject prefix + the action name).
+    """
+    print("[→] Listing all Workflow Rules …")
+    rule_names = list_metadata(session_id, meta_url, "WorkflowRule")
+    print(f"    Found {len(rule_names)} rule(s).")
+
+    # Pre-populate one set per action type value (Alert, FieldUpdate, …)
+    index: dict[str, set[str]] = {v: set() for v in ACTION_TYPE_MAP.values()}
+
+    for i in range(0, len(rule_names), 10):
+        chunk = rule_names[i : i + 10]
+        print(f"    Reading rules {i+1}–{i+len(chunk)} …")
+        root = read_metadata_chunk(session_id, meta_url, "WorkflowRule", chunk)
+
+        for record in root.findall(".//mns:records", NS):
+            rule_full_name = _txt(record, "mns:fullName")
+            sobject        = rule_full_name.split(".")[0] if "." in rule_full_name else ""
+
+            for action_elem in record.findall("mns:actions", NS):
+                atype = _txt(action_elem, "mns:type")
+                aname = _txt(action_elem, "mns:name")
+                if atype in index and aname:
+                    canonical = f"{sobject}.{aname}" if sobject else aname
+                    index[atype].add(canonical)
+
+    return index
+
+
+# ─── Core: collect all actions & diff ─────────────────────────────────────────
+def find_orphan_actions(session_id: str, meta_url: str) -> dict[str, list[dict]]:
+    """
+    For every action metadata type, list all instances, then remove those
+    found in the rule-action index.  Returns orphans grouped by metadata type.
+    """
+    rule_index = build_rule_action_index(session_id, meta_url)
+
+    orphans_by_type: dict[str, list[dict]] = {}
+
+    for meta_type, action_type_value in ACTION_TYPE_MAP.items():
+        print(f"\n[→] Listing {meta_type} …")
+        try:
+            all_names = list_metadata(session_id, meta_url, meta_type)
+        except Exception as exc:
+            print(f"    [!] Could not list {meta_type}: {exc}")
+            orphans_by_type[meta_type] = []
+            continue
+
+        print(f"    Total in org: {len(all_names)}")
+        referenced = rule_index.get(action_type_value, set())
+        orphan_names = sorted(set(all_names) - referenced)
+        print(f"    Referenced by rules: {len(referenced)}")
+        print(f"    Orphaned           : {len(orphan_names)}")
+
+        if not orphan_names:
+            orphans_by_type[meta_type] = []
+            continue
+
+        # Fetch details for orphans
+        orphan_details: list[dict] = []
+        for i in range(0, len(orphan_names), 10):
+            chunk = orphan_names[i : i + 10]
+            print(f"    Reading orphan details {i+1}–{i+len(chunk)} …")
+            root = read_metadata_chunk(session_id, meta_url, meta_type, chunk)
+            for rec in root.findall(".//mns:records", NS):
+                orphan_details.append(_record_to_dict(rec, meta_type))
+
+        orphans_by_type[meta_type] = orphan_details
+
+    return orphans_by_type
+
+
+def _record_to_dict(record: ET.Element, meta_type: str) -> dict:
+    """
+    Convert a metadata record element to a concise dict.
+    Fields extracted differ per action type.
+    """
+    base: dict = {
+        "metadataType": meta_type,
+        "fullName":     _txt(record, "mns:fullName"),
+        "description":  _txt(record, "mns:description"),
+    }
+
+    if meta_type == "WorkflowAlert":
+        base["template"]      = _txt(record, "mns:template")
+        base["senderType"]    = _txt(record, "mns:senderType")
+        base["recipientCount"]= len(record.findall("mns:recipients", NS))
+
+    elif meta_type == "WorkflowFieldUpdate":
+        base["field"]         = _txt(record, "mns:field")
+        base["operation"]     = _txt(record, "mns:operation")
+        base["formula"]       = _txt(record, "mns:formula")
+        base["literalValue"]  = _txt(record, "mns:literalValue")
+        base["object"]        = _txt(record, "mns:object")
+
+    elif meta_type == "WorkflowOutboundMessage":
+        base["endpointUrl"]   = _txt(record, "mns:endpointUrl")
+        base["object"]        = _txt(record, "mns:object")
+        base["integrationUser"]= _txt(record, "mns:integrationUser")
+
+    elif meta_type == "WorkflowTask":
+        base["subject"]       = _txt(record, "mns:subject")
+        base["assignedToType"]= _txt(record, "mns:assignedToType")
+        base["status"]        = _txt(record, "mns:status")
+        base["priority"]      = _txt(record, "mns:priority")
+
+    elif meta_type == "WorkflowSend":
+        base["label"]         = _txt(record, "mns:label")
+
+    return base
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    session_id, meta_url = login(USERNAME, PASSWORD, TOKEN, SANDBOX)
+
+    orphans_by_type = find_orphan_actions(session_id, meta_url)
+
+    # Flatten for JSON
+    flat_output = {
+        meta_type: records
+        for meta_type, records in orphans_by_type.items()
+    }
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(flat_output, f, indent=2, ensure_ascii=False)
+
+    # Summary
+    print("\n" + "═" * 60)
+    print("  ORPHANED WORKFLOW ACTIONS SUMMARY")
+    print("═" * 60)
+    total = 0
+    for meta_type, records in orphans_by_type.items():
+        label = meta_type.replace("Workflow", "")
+        print(f"  {label:<25} {len(records):>5} orphan(s)")
+        total += len(records)
+    print("─" * 60)
+    print(f"  {'TOTAL':<25} {total:>5}")
+    print("═" * 60)
+    print(f"\n[✓] Results written to '{OUTPUT_FILE}'")
+
+
+if __name__ == "__main__":
+    main()
